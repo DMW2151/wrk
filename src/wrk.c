@@ -10,6 +10,7 @@ static struct config {
     uint64_t threads;
     uint64_t timeout;
     uint64_t pipeline;
+    uint64_t rate;
     bool     delay;
     bool     dynamic;
     bool     latency;
@@ -47,6 +48,7 @@ static void usage() {
            "    -c, --connections <N>  Connections to keep open   \n"
            "    -d, --duration    <T>  Duration of test           \n"
            "    -t, --threads     <N>  Number of threads to use   \n"
+           "    -R, --rate        <N>  Work rate (req/s)          \n"
            "                                                      \n"
            "    -s, --script      <S>  Load Lua script file       \n"
            "    -H, --header      <H>  Add header to request      \n"
@@ -137,6 +139,9 @@ int main(int argc, char **argv) {
     char *time = format_time_s(cfg.duration);
     printf("Running %s test @ %s\n", time, url);
     printf("  %"PRIu64" threads and %"PRIu64" connections\n", cfg.threads, cfg.connections);
+    if (cfg.rate) {
+        printf("  Target rate: %"PRIu64" req/s\n", cfg.rate);
+    }
 
     uint64_t start    = time_us();
     uint64_t complete = 0;
@@ -345,7 +350,28 @@ static int response_complete(http_parser *parser) {
             thread->errors.timeout++;
         }
         c->delayed = cfg.delay;
-        aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
+        if (cfg.rate) {
+            /* Pace each connection so aggregate throughput = -R req/s.
+             * The full request cycle is: send → receive → wait. We want the
+             * whole cycle to equal connections/rate seconds, so subtract the
+             * observed round-trip latency from the target interval. Without
+             * this, latency is added on top of the delay and the actual rate
+             * undershoots the target. */
+            uint64_t latency_us = now - c->start;
+            uint64_t target_us  = (cfg.connections * 1000000) / cfg.rate;
+            uint64_t delay_ms   = (target_us > latency_us + 1000)
+                                  ? (target_us - latency_us) / 1000
+                                  : 1;
+            if (http_should_keep_alive(parser)) {
+                /* Only schedule the timer on keep-alive connections; on a
+                 * non-keep-alive connection reconnect_socket (below) re-arms
+                 * via socket_connected, and a dangling timer would
+                 * double-register socket_writeable on the new fd. */
+                aeCreateTimeEvent(thread->loop, delay_ms, delay_request, c, NULL);
+            }
+        } else {
+            aeCreateFileEvent(thread->loop, c->fd, AE_WRITABLE, socket_writeable, c);
+        }
     }
 
     if (!http_should_keep_alive(parser)) {
@@ -470,6 +496,7 @@ static struct option longopts[] = {
     { "connections", required_argument, NULL, 'c' },
     { "duration",    required_argument, NULL, 'd' },
     { "threads",     required_argument, NULL, 't' },
+    { "rate",        required_argument, NULL, 'R' },
     { "script",      required_argument, NULL, 's' },
     { "header",      required_argument, NULL, 'H' },
     { "latency",     no_argument,       NULL, 'L' },
@@ -489,7 +516,7 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
     cfg->duration    = 10;
     cfg->timeout     = SOCKET_TIMEOUT_MS;
 
-    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:Lrv?", longopts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "t:c:d:s:H:T:R:Lrv?", longopts, NULL)) != -1) {
         switch (c) {
             case 't':
                 if (scan_metric(optarg, &cfg->threads)) return -1;
@@ -499,6 +526,9 @@ static int parse_args(struct config *cfg, char **url, struct http_parser_url *pa
                 break;
             case 'd':
                 if (scan_time(optarg, &cfg->duration)) return -1;
+                break;
+            case 'R':
+                if (scan_metric(optarg, &cfg->rate)) return -1;
                 break;
             case 's':
                 cfg->script = optarg;
